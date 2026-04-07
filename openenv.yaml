@@ -1,0 +1,36 @@
+spec_version: 1
+name: energy_grid
+description: "RL environment for training agents to manage energy grid power distribution across residential, industrial, commercial, and hospital loads."
+type: space
+runtime: fastapi
+app: energy_grid_env.server.app:app
+port: 7860
+
+action:
+  model: EnergyGridAction
+  fields:
+    - name: action
+      type: string
+      enum: [EQUAL, MIN_FIRST, MAX_FIRST, PROPORTIONAL]
+    - name: battery_mode
+      type: string
+      enum: [SAVE, MODERATE, SPEND]
+
+observation:
+  model: EnergyGridObservation
+
+tasks:
+  - name: delivery
+    description: "Average fraction of total demand met across all loads per step (0.0–1.0)"
+    score_field: task_scores.delivery
+    score_range: [0.0, 1.0]
+
+  - name: hospital_coverage
+    description: "Average fraction of hospital/critical load demand met per step (0.0–1.0)"
+    score_field: task_scores.hospital_coverage
+    score_range: [0.0, 1.0]
+
+  - name: battery_management
+    description: "Fraction of battery remaining after each step — rewards conservative use (0.0–1.0)"
+    score_field: task_scores.battery_management
+    score_range: [0.0, 1.0]
