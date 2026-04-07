@@ -14,12 +14,12 @@ energy_grid_env/        # Installable OpenEnv environment package
     app.py                      # FastAPI server entry point
     energy_grid_environment.py  # Core environment logic
     Dockerfile                  # Container build for HF Space / eval harness
-  models.py                     # Pydantic action/observation models
-  client.py                     # OpenEnv client wrapper
-  openenv.yaml                  # Environment manifest (tasks + graders)
-  pyproject.toml                # Package metadata and dependencies
+  models.py                     # Pydantic action/observation models (action + observation types)
+  client.py                     # OpenEnv HTTP client wrapper
+  openenv.yaml                  # Environment manifest — spec, actions, tasks, graders
+  pyproject.toml                # Package metadata and pip dependencies
 
-energy_grid_scaffold/   # Scaffold / reference implementation
+energy_grid_scaffold/   # Scaffold / reference implementation (mirrors energy_grid_env)
   server/
     app.py
     energy_grid_scaffold_environment.py
@@ -27,10 +27,13 @@ energy_grid_scaffold/   # Scaffold / reference implementation
     Dockerfile
   models.py
   client.py
+  pyproject.toml
 
-env.py                  # Minimal standalone env (no dependencies)
-train.py                # Q-learning training script
-inference.py            # LLM inference script (competition submission)
+env.py                  # Minimal standalone env — no server, no dependencies, for fast local use
+train.py                # Tabular Q-learning training script
+inference.py            # LLM agent inference script (competition submission entry point)
+demo.py                 # Interactive demo — manually step through the environment
+qtable.json             # Saved Q-table from the last training run
 ```
 
 ## Environment Details
