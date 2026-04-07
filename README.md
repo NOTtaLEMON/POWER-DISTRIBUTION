@@ -1,3 +1,13 @@
+---
+title: Power Distribution
+emoji: ⚡
+colorFrom: yellow
+colorTo: blue
+sdk: docker
+pinned: false
+app_port: 8000
+---
+
 # Power Distribution
 
 A reinforcement learning environment for training agents to manage energy grid power distribution. Built on the [OpenEnv](https://github.com/OpenEnvProject/OpenEnv) framework.
