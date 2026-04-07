@@ -17,16 +17,22 @@ class RegionType(str, Enum):
     HOSPITAL    = "HOSPITAL"     # near-constant high demand, critical (never drops much)
 
 
-# The 4 distribution strategies the agent can choose
 class DistributeAction(str, Enum):
-    EQUAL        = "EQUAL"        # Split generation evenly across all active loads
+    EQUAL        = "EQUAL"        # Split generation evenly across all loads
     MIN_FIRST    = "MIN_FIRST"    # Satisfy smallest loads first (maximise fully-met count)
     MAX_FIRST    = "MAX_FIRST"    # Satisfy largest loads first (protect critical loads)
     PROPORTIONAL = "PROPORTIONAL" # Allocate proportionally to each load's demand
 
 
+class BatteryMode(str, Enum):
+    SAVE     = "SAVE"      # Don't draw battery this step — reserve for later
+    MODERATE = "MODERATE"  # Draw up to half of remaining battery to cover gaps
+    SPEND    = "SPEND"     # Draw as much battery as needed to cover all gaps
+
+
 class EnergyGridAction(Action):
-    action: DistributeAction = Field(..., description="Distribution strategy")
+    action:       DistributeAction = Field(DistributeAction.PROPORTIONAL, description="How to distribute generated power across loads")
+    battery_mode: BatteryMode      = Field(BatteryMode.SPEND,             description="How aggressively to draw battery this step")
 
 
 # What the agent sees after each step
@@ -48,8 +54,14 @@ class EnergyGridObservation(Observation):
     num_hospital:    int = Field(0, description="Number of hospital/critical loads")
 
     # Power supply
-    generation:   int   = Field(..., description="Power being generated this step")
-    battery:      int   = Field(..., description="Energy stored in battery")
+    generation_forecast: int   = Field(..., description="Forecasted power generation this step (±20% of actual)")
+    battery:             int   = Field(..., description="Energy stored in battery")
+
+    # Demand momentum — did total demand go up, stay flat, or fall vs the previous step?
+    # -1 = falling  (demand dropped >10%)   → consider conserving battery
+    #  0 = flat      (within ±10%)
+    # +1 = rising   (demand rose >10%)      → peak may be approaching, plan ahead
+    demand_trend: int = Field(0, description="Demand trend vs previous step: -1 falling, 0 flat, +1 rising")
 
     reward:       float = Field(0.0,   description="Reward from the last action")
     done:         bool  = Field(False, description="Whether the episode has ended")

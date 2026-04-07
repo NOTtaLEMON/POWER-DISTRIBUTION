@@ -55,6 +55,7 @@ How Q-learning works (plain English):
 import random
 import sys
 import os
+import json
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -62,62 +63,67 @@ import numpy as np
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(__file__))
 from energy_grid_env.server.energy_grid_environment import EnergyGridEnvironment
-from energy_grid_env.models import DistributeAction, EnergyGridAction
+from itertools import product
+from energy_grid_env.models import AllocWeight, BatteryMode, EnergyGridAction
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-ACTIONS   = list(DistributeAction)   # [EQUAL, MIN_FIRST, MAX_FIRST, PROPORTIONAL]
+# Action space: independent weight (NORMAL/HIGH) for each of 4 region types
+# plus battery mode — 2^4 × 3 = 48 actions.
+# No hand-coded strategies; the agent learns its own allocation policy.
+WEIGHT_OPTIONS  = list(AllocWeight)   # NORMAL, HIGH
+BATTERY_OPTIONS = list(BatteryMode)   # SAVE, MODERATE, SPEND
+ACTIONS = [
+    (r, i, c, h, b)
+    for r, i, c, h in product(WEIGHT_OPTIONS, repeat=4)
+    for b in BATTERY_OPTIONS
+]
 N_ACTIONS = len(ACTIONS)
 
 
 def encode_state(obs) -> tuple:
     """
-    4-value state tuple.  Total: 3 × 3 × 3 × 8 = 216 states.
+    4-value state tuple.  Total: 4 × 3 × 3 × 3 = 108 states.
 
-    gen_coverage:
-      How well does GENERATION ALONE cover total demand?
-        0 = scarce   (gen < 80% of demand)   — battery needed right now
-        1 = balanced (80–120%)
-        2 = surplus  (gen > 120% of demand)  — battery will recharge
-      This captures the actual live demand (including anomalous loads) so
-      the agent can react even when a load breaks its expected pattern.
-
-    battery_level:
-        0 = low    (0–2 units)
-        1 = medium (3–6 units)
-        2 = high   (7–10 units)
+    supply_coverage:
+      (generation_forecast + battery) / total_demand — how comfortably can all
+      loads be covered this step with everything available?
+        0 = critical  (< 70%)   — shortfalls unavoidable, must triage
+        1 = tight     (70–100%) — careful distribution needed
+        2 = balanced  (100–140%) — can meet all loads comfortably
+        3 = abundant  (> 140%)  — surplus; good time to let battery recover
 
     hospital_presence:
-      How many hospital/critical loads are active?
-        0 = none  (0 hospitals)
-        1 = some  (1–2 hospitals)
-        2 = many  (3+ hospitals)
-      Hospitals draw near-constant high demand regardless of time —
-      the agent needs a different battery strategy than a grid of
-      residentials (which only peak in the evening).  load_pressure
-      (total count) can't distinguish these; hospital_presence can.
+        0 = none  (0 hospitals)  1 = some (1–2)  2 = many (3+)
+      Critical loads skew the cost of under-delivery upward; the agent
+      should be more aggressive with battery when hospitals are present.
 
-    time_slot:
-      Which 3-hour window of the day? (0 = 00:00–3:00 … 7 = 21:00–00:00)
-      Separates Q-table entries by time so the agent can learn
-      slot-specific strategies (e.g. hold battery through slots 0–5,
-      discharge into residentials at slot 6).
+    demand_trend:
+      Did total demand rise, stay flat, or fall vs the previous step?
+        0 = falling (−10%+)   — past the peak, safe to hold battery
+        1 = flat    (±10%)    — steady state
+        2 = rising  (+10%+)   — approaching a peak, consider saving now
+      NOTE: peak timing is randomised per week, so the agent cannot
+      hard-code "slot 6 = rising → save".  It must react to observed trend.
+
+    battery_level:
+      How much reserve is stored?
+        0 = low (0–2)  1 = medium (3–6)  2 = high (7–10)
+      Knowing the reserve independently of supply_coverage lets the agent
+      distinguish "plenty available because gen is high" (recharge later)
+      from "plenty available because battery is full" (could afford to spend).
     """
-    ratio = obs.generation / max(obs.total_demand, 1)
-    if ratio < 0.8:
-        gen_coverage = 0
-    elif ratio > 1.2:
-        gen_coverage = 2
+    total_supply = obs.generation_forecast + obs.battery
+    ratio = total_supply / max(obs.total_demand, 1)
+    if ratio < 0.7:
+        supply_coverage = 0
+    elif ratio < 1.0:
+        supply_coverage = 1
+    elif ratio < 1.4:
+        supply_coverage = 2
     else:
-        gen_coverage = 1
-
-    if obs.battery <= 2:
-        battery_level = 0
-    elif obs.battery <= 6:
-        battery_level = 1
-    else:
-        battery_level = 2
+        supply_coverage = 3
 
     if obs.num_hospital == 0:
         hospital_presence = 0
@@ -126,7 +132,17 @@ def encode_state(obs) -> tuple:
     else:
         hospital_presence = 2
 
-    return (gen_coverage, battery_level, hospital_presence, obs.time_slot)
+    # demand_trend from env: -1/0/+1 → remap to 0/1/2 for use as dict key
+    demand_trend = obs.demand_trend + 1
+
+    if obs.battery <= 2:
+        battery_level = 0
+    elif obs.battery <= 6:
+        battery_level = 1
+    else:
+        battery_level = 2
+
+    return (supply_coverage, hospital_presence, demand_trend, battery_level)
 
 
 # ---------------------------------------------------------------------------
@@ -192,20 +208,23 @@ def trend_arrow(values: list[float]) -> str:
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
-EPISODES      = 8000   # 216 states; more episodes = richer Q-table coverage
+EPISODES      = 40000  # 48 actions × 108 states; more episodes for good Q-value coverage
 MAX_STEPS     = 8     # one full day = 8 × 3-hour slots
-ALPHA         = 0.1
+ALPHA_START   = 0.4   # high initial learning rate — converge fast early on
+ALPHA_END     = 0.05  # decay to low rate at end — stable fine-tuning
+ALPHA_DECAY   = 0.9997
 GAMMA         = 0.95
 EPSILON_START = 1.0
-EPSILON_END   = 0.05
-EPSILON_DECAY = 0.999
-PRINT_EVERY   = 300   # print a summary every N episodes
+EPSILON_END   = 0.02  # lower floor — less random noise during exploitation
+EPSILON_DECAY = 0.9997
+PRINT_EVERY   = 1000
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 env             = EnergyGridEnvironment()
 epsilon         = EPSILON_START
+alpha           = ALPHA_START
 episode_rewards = []
 window_avgs     = []   # one entry per print window, used for trend
 
@@ -225,7 +244,11 @@ for episode in range(1, EPISODES + 1):
         else:
             action_idx = int(np.argmax(get_q(state)))
 
-        action     = EnergyGridAction(action=ACTIONS[action_idx])
+        r, i, c, h, batt = ACTIONS[action_idx]
+        action = EnergyGridAction(
+            residential=r, industrial=i, commercial=c, hospital=h,
+            battery_mode=batt,
+        )
         obs        = env.step(action)
         next_state = encode_state(obs)
         reward     = obs.reward
@@ -234,7 +257,7 @@ for episode in range(1, EPISODES + 1):
         # Bellman update
         current_q   = get_q(state)[action_idx]
         best_next_q = max(get_q(next_state))
-        get_q(state)[action_idx] = current_q + ALPHA * (
+        get_q(state)[action_idx] = current_q + alpha * (
             reward + GAMMA * best_next_q - current_q
         )
 
@@ -243,6 +266,7 @@ for episode in range(1, EPISODES + 1):
             break
 
     epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
+    alpha   = max(ALPHA_END,   alpha   * ALPHA_DECAY)
     episode_rewards.append(total_reward)
 
     if episode % PRINT_EVERY == 0:
@@ -270,7 +294,11 @@ def run_agent(use_q: bool, episodes: int = 200) -> float:
                 action_idx = int(np.argmax(get_q(state)))
             else:
                 action_idx = random.randint(0, N_ACTIONS - 1)
-            obs       = env.step(EnergyGridAction(action=ACTIONS[action_idx]))
+            r, i, c, h, batt = ACTIONS[action_idx]
+            obs = env.step(EnergyGridAction(
+                residential=r, industrial=i, commercial=c, hospital=h,
+                battery_mode=batt,
+            ))
             ep_reward += obs.reward
             state      = encode_state(obs)
             if obs.done:
@@ -297,3 +325,16 @@ improvement  = q_score - random_score
 print(f"  Random agent     : {random_score:>+7.2f}  [{score_grade(random_score).strip()}]")
 print(f"  Q-learning agent : {q_score:>+7.2f}  [{score_grade(q_score).strip()}]")
 print(f"  Improvement      : {improvement:>+7.2f}  ({'better' if improvement > 0 else 'similar/worse'})")
+
+# ---------------------------------------------------------------------------
+# Save Q-table so demo.py can use the trained agent
+# ---------------------------------------------------------------------------
+QTABLE_PATH = os.path.join(os.path.dirname(__file__), "qtable.json")
+with open(QTABLE_PATH, "w") as f:
+    # JSON requires string keys; store actions as (dist, batt) string pairs
+    serialisable = {
+        str(state): {"q": qvals, "action": list(ACTIONS[int(np.argmax(qvals))])}
+        for state, qvals in Q.items()
+    }
+    json.dump({"actions": [list(a) for a in ACTIONS], "table": serialisable}, f, indent=2)
+print(f"\n  Q-table saved → {QTABLE_PATH}")

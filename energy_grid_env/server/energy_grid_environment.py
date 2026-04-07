@@ -10,7 +10,7 @@ except ImportError:
     from core.env_server import Environment
     from core.env_server.types import State
 
-from ..models import DistributeAction, EnergyGridAction, EnergyGridObservation, RegionType
+from ..models import AllocWeight, BatteryMode, EnergyGridAction, EnergyGridObservation, RegionType
 
 # ---------------------------------------------------------------------------
 # Time slots: each slot = 3 hours, 8 slots cover one full day
@@ -107,12 +107,22 @@ class EnergyGridEnvironment(Environment):
         self.battery    = 5
         self.time_slot  = 0
         self._state     = State(episode_id=str(uuid.uuid4()), step_count=0)
+        # Weekly demand-profile rotation: every 7 episodes the peak window shifts
+        # randomly so the agent can't hard-code "slot 6 = high demand = spend".
+        self._episode_count  = 0
+        self._week_offset    = random.randint(0, 7)
+        self.prev_total_demand: int = 0
 
     # ------------------------------------------------------------------
     # OpenEnv required methods
     # ------------------------------------------------------------------
 
     def reset(self) -> EnergyGridObservation:
+        # Rotate demand peak window every 7 episodes (one "week")
+        self._episode_count += 1
+        if self._episode_count % 7 == 0:
+            self._week_offset = random.randint(0, 7)
+
         n = random.randint(MIN_LOADS, MAX_LOADS)
         self.loads      = [
             [random.randint(3, 8), random.choice(ALL_TYPES), random.random() < ANOMALY_LOAD_PROB]
@@ -123,7 +133,8 @@ class EnergyGridEnvironment(Environment):
         self.time_slot  = 0
         self._state     = State(episode_id=str(uuid.uuid4()), step_count=0)
         demands = [self._current_demand(i) for i in range(n)]
-        return self._make_obs(demands, reward=0.0, done=False, message="Day started. Slot 0: 00:00-03:00")
+        self.prev_total_demand = sum(demands)
+        return self._make_obs(demands, reward=0.0, done=False, message="Day started. Slot 0: 00:00-03:00", generation_forecast=self._noisy_forecast(self.generation), demand_trend=0)
 
     def step(self, action: EnergyGridAction) -> EnergyGridObservation:
         self._state.step_count += 1
@@ -132,18 +143,25 @@ class EnergyGridEnvironment(Environment):
         # Current demand for each load (base × time multiplier)
         demands = [self._current_demand(i) for i in range(n)]
 
-        # --- 1. Distribute generation by chosen strategy ---
-        dist = self._distribute(action.action, self.generation, demands)
+        # --- 1. Distribute generation using learned per-type weights ---
+        dist = self._distribute(action, self.generation, demands)
 
-        # --- 2. Battery covers remaining gaps in same priority order ---
-        order        = self._priority_order(action.action, demands)
-        battery_used = 0
+        # --- 2. Battery covers remaining gaps — respecting chosen battery mode ---
+        order = self._priority_order(action, demands)
+        max_battery_draw = {
+            BatteryMode.SAVE:     0,
+            BatteryMode.MODERATE: self.battery // 2,
+            BatteryMode.SPEND:    self.battery,
+        }[action.battery_mode]
+        battery_budget = max_battery_draw
+        battery_used   = 0
         for i in order:
             gap = max(0, demands[i] - dist[i])
-            if gap > 0 and (self.battery - battery_used) > 0:
-                cover        = min(gap, self.battery - battery_used)
-                dist[i]     += cover
+            if gap > 0 and battery_budget > 0:
+                cover         = min(gap, battery_budget)
+                dist[i]      += cover
                 battery_used += cover
+                battery_budget -= cover
         self.battery = max(0, self.battery - battery_used)
 
         # --- 3. Surplus generation recharges battery ---
@@ -173,6 +191,7 @@ class EnergyGridEnvironment(Environment):
 
         # --- 7. Refresh generation ---
         self.generation = random.randint(5, 15)
+        next_forecast   = self._noisy_forecast(self.generation)
 
         done    = self._state.step_count >= MAX_STEPS
         message = (
@@ -186,7 +205,18 @@ class EnergyGridEnvironment(Environment):
         # observation reflects the same values used for reward, not a
         # fresh resample (demand is stochastic).
         next_demands = [self._current_demand(i) for i in range(len(self.loads))]
-        return self._make_obs(next_demands, reward=reward, done=done, message=message)
+
+        # demand_trend: did total demand rise, stay flat, or fall vs this step?
+        next_total = sum(next_demands)
+        if next_total > sum(demands) * 1.1:
+            demand_trend = 1
+        elif next_total < sum(demands) * 0.9:
+            demand_trend = -1
+        else:
+            demand_trend = 0
+        self.prev_total_demand = sum(demands)
+
+        return self._make_obs(next_demands, reward=reward, done=done, message=message, generation_forecast=next_forecast, demand_trend=demand_trend)
 
     @property
     def state(self) -> State:
@@ -196,56 +226,56 @@ class EnergyGridEnvironment(Environment):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _noisy_forecast(self, gen: int) -> int:
+        """Return a ±20% noisy estimate of actual generation — what the agent sees."""
+        return max(1, round(gen * random.uniform(0.8, 1.2)))
+
     def _current_demand(self, i: int) -> int:
         """Sample actual demand for load i from its (min, max) range for the current slot.
 
-        Anomalous loads draw from ANOMALY_RANGE regardless of type or slot,
-        simulating consumers that don't follow their expected pattern.
+        The slot index is shifted by _week_offset (rotates which time-of-day is peak),
+        so the agent cannot hard-code time-of-day → battery strategy.
+        Anomalous loads draw from ANOMALY_RANGE regardless of type or slot.
         """
         base, rtype, is_anomalous = self.loads[i]
-        lo, hi     = ANOMALY_RANGE if is_anomalous else DEMAND_PROFILES[rtype][self.time_slot]
+        slot       = (self.time_slot + self._week_offset) % 8
+        lo, hi     = ANOMALY_RANGE if is_anomalous else DEMAND_PROFILES[rtype][slot]
         multiplier = random.uniform(lo, hi)
         return max(1, round(base * multiplier))
 
-    def _priority_order(self, action: DistributeAction, demands: list[int]) -> list[int]:
-        n = len(demands)
-        if action == DistributeAction.MIN_FIRST:
-            return sorted(range(n), key=lambda i:  demands[i])
-        elif action == DistributeAction.MAX_FIRST:
-            return sorted(range(n), key=lambda i: -demands[i])
-        else:
-            return sorted(range(n), key=lambda i:  demands[i])   # min-first for battery
+    def _type_weights(self, action: EnergyGridAction) -> dict:
+        """Map each RegionType to its numeric weight from the action."""
+        weight_map = {AllocWeight.NORMAL: 1.0, AllocWeight.HIGH: 2.0}
+        return {
+            RegionType.RESIDENTIAL: weight_map[action.residential],
+            RegionType.INDUSTRIAL:  weight_map[action.industrial],
+            RegionType.COMMERCIAL:  weight_map[action.commercial],
+            RegionType.HOSPITAL:    weight_map[action.hospital],
+        }
 
-    def _distribute(self, action: DistributeAction, total: int, demands: list[int]) -> list[int]:
-        n     = len(demands)
-        alloc = [0] * n
+    def _priority_order(self, action: EnergyGridAction, demands: list[int]) -> list[int]:
+        """Sort load indices by (weight × demand) descending — highest-priority loads get battery first."""
+        tw = self._type_weights(action)
+        return sorted(range(len(demands)), key=lambda i: -(tw[self.loads[i][1]] * demands[i]))
 
-        if action == DistributeAction.EQUAL:
-            base  = total // n
-            extra = total %  n
+    def _distribute(self, action: EnergyGridAction, total: int, demands: list[int]) -> list[int]:
+        """Allocate power proportionally to each load's (weight × demand).
+        The weights come from the action, learned by the agent — no hard-coded strategy.
+        """
+        n  = len(demands)
+        tw = self._type_weights(action)
+        weighted = [demands[i] * tw[self.loads[i][1]] for i in range(n)]
+        total_w  = sum(weighted)
+        if total_w == 0:
+            base, extra = divmod(total, n)
             return [base + (1 if i < extra else 0) for i in range(n)]
+        alloc     = [int(total * w / total_w) for w in weighted]
+        remainder = total - sum(alloc)
+        for i in sorted(range(n), key=lambda i: -weighted[i])[:remainder]:
+            alloc[i] += 1
+        return alloc
 
-        if action in (DistributeAction.MIN_FIRST, DistributeAction.MAX_FIRST):
-            reverse   = (action == DistributeAction.MAX_FIRST)
-            order     = sorted(range(n), key=lambda i: (-1 if reverse else 1) * demands[i])
-            remaining = total
-            for i in order:
-                give      = min(demands[i], remaining)
-                alloc[i]  = give
-                remaining -= give
-            return alloc
-
-        if action == DistributeAction.PROPORTIONAL:
-            total_demand = sum(demands)
-            alloc        = [int(total * d / total_demand) for d in demands]
-            remainder    = total - sum(alloc)
-            for i in sorted(range(n), key=lambda i: -demands[i])[:remainder]:
-                alloc[i] += 1
-            return alloc
-
-        return [total // n] * n
-
-    def _make_obs(self, demands: list[int], reward: float, done: bool, message: str) -> EnergyGridObservation:
+    def _make_obs(self, demands: list[int], reward: float, done: bool, message: str, generation_forecast: int = 0, demand_trend: int = 0) -> EnergyGridObservation:
         types = [load[1] for load in self.loads]
         return EnergyGridObservation(
             time_slot        = self.time_slot,
@@ -258,8 +288,9 @@ class EnergyGridEnvironment(Environment):
             num_industrial   = types.count(RegionType.INDUSTRIAL),
             num_commercial   = types.count(RegionType.COMMERCIAL),
             num_hospital     = types.count(RegionType.HOSPITAL),
-            generation       = self.generation,
-            battery          = self.battery,
+            generation_forecast = generation_forecast,
+            battery             = self.battery,
+            demand_trend        = demand_trend,
             reward           = reward,
             done             = done,
             message          = message,
