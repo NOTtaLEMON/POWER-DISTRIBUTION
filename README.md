@@ -4,7 +4,7 @@ A reinforcement learning environment for training agents to manage energy grid p
 
 ## Overview
 
-The agent controls a simulated energy grid across an 8-step episode (one full day, split into 3-hour slots). Each step, it chooses a distribution strategy to allocate generated power across multiple loads — residential, industrial, commercial, and hospital — each with realistic time-varying demand profiles.
+The agent controls a simulated energy grid across an 8-step episode (one full day, split into 3-hour slots). Each step, it chooses how to distribute generated power across multiple loads — residential, industrial, commercial, and hospital — and how aggressively to draw from the battery. Demand varies with time of day, and generation is only visible as a noisy forecast (±20%).
 
 ## Project Structure
 
@@ -13,9 +13,11 @@ energy_grid_env/        # Installable OpenEnv environment package
   server/
     app.py                      # FastAPI server entry point
     energy_grid_environment.py  # Core environment logic
+    Dockerfile                  # Container build for HF Space / eval harness
   models.py                     # Pydantic action/observation models
   client.py                     # OpenEnv client wrapper
-  openenv.yaml                  # Environment manifest
+  openenv.yaml                  # Environment manifest (tasks + graders)
+  pyproject.toml                # Package metadata and dependencies
 
 energy_grid_scaffold/   # Scaffold / reference implementation
   server/
@@ -28,11 +30,16 @@ energy_grid_scaffold/   # Scaffold / reference implementation
 
 env.py                  # Minimal standalone env (no dependencies)
 train.py                # Q-learning training script
+inference.py            # LLM inference script (competition submission)
 ```
 
 ## Environment Details
 
 ### Actions
+
+Each step the agent chooses two things:
+
+**Distribution strategy** — how to split generated power across loads:
 
 | Action | Description |
 |---|---|
@@ -40,6 +47,14 @@ train.py                # Q-learning training script
 | `MIN_FIRST` | Satisfy smallest loads first (maximise fully-met count) |
 | `MAX_FIRST` | Satisfy largest loads first (protect critical loads) |
 | `PROPORTIONAL` | Allocate proportionally to each load's demand |
+
+**Battery mode** — how aggressively to draw stored energy to cover gaps:
+
+| Mode | Description |
+|---|---|
+| `SAVE` | Don't draw battery this step — reserve for later peaks |
+| `MODERATE` | Draw up to half of remaining battery to cover gaps |
+| `SPEND` | Draw as much battery as needed to cover all gaps |
 
 ### Region Types & Demand Profiles
 
@@ -51,6 +66,12 @@ Each load has a region type that determines its demand multiplier per time slot:
 | `INDUSTRIAL` | 09:00–15:00 | Near-zero at night, heavy during work hours |
 | `COMMERCIAL` | 09:00–18:00 | Closed at night, steady business hours |
 | `HOSPITAL` | Always | Near-constant, never drops below ~75% |
+
+~15% of loads are **anomalous** — they ignore their region profile and draw from an unpredictable range, forcing the agent to react to observed demand rather than memorised patterns.
+
+### Generation Forecast
+
+The agent sees `generation_forecast` — a noisy ±20% estimate of actual generation. True generation is hidden. The agent must account for this uncertainty in its distribution and battery decisions.
 
 ### Reward
 
@@ -68,12 +89,31 @@ Where `delivery ratio = min(supplied, demanded) / demanded` averaged over all lo
 | -4.0 – 0.0 | Poor |
 | < -4.0 | Bad |
 
+### Task Graders (0.0 – 1.0)
+
+Three graders score each step independently, reported in `task_scores`:
+
+| Task | Description |
+|---|---|
+| `delivery` | Average fraction of total demand met across all loads |
+| `hospital_coverage` | Average fraction of hospital/critical demand met |
+| `battery_management` | Fraction of battery remaining — rewards conservative use |
+
 ## Getting Started
 
 ### Train the Q-learning agent
 
 ```bash
 python train.py
+```
+
+### Run the LLM inference script
+
+```bash
+export API_BASE_URL=https://router.huggingface.co/v1
+export MODEL_NAME=openai/gpt-4o-mini
+export HF_TOKEN=your_token_here
+python inference.py
 ```
 
 ### Run the environment server
@@ -89,9 +129,17 @@ cd energy_grid_env
 uvicorn server.app:app --reload
 ```
 
+### Build the Docker image
+
+```bash
+docker build -f energy_grid_env/server/Dockerfile -t energy-grid:latest energy_grid_env
+```
+
 ## Dependencies
 
 - [OpenEnv](https://github.com/OpenEnvProject/OpenEnv) `>=0.2.0`
 - FastAPI `>=0.115.0`
 - Uvicorn `>=0.24.0`
 - NumPy
+- OpenAI Python client (for `inference.py`)
+

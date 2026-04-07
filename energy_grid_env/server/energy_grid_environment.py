@@ -10,7 +10,7 @@ except ImportError:
     from core.env_server import Environment
     from core.env_server.types import State
 
-from ..models import AllocWeight, BatteryMode, EnergyGridAction, EnergyGridObservation, RegionType
+from ..models import DistributeAction, BatteryMode, EnergyGridAction, EnergyGridObservation, RegionType
 
 # ---------------------------------------------------------------------------
 # Time slots: each slot = 3 hours, 8 slots cover one full day
@@ -174,6 +174,29 @@ class EnergyGridEnvironment(Environment):
         reward         = 2.0 * delivery_ratio - 1.0
         reward        += 0.1 * (self.battery / MAX_BATTERY)
 
+        # --- 4b. Task grader scores (all 0.0–1.0) ---
+        # delivery: how well all loads were collectively served
+        delivery_score = delivery_ratio
+
+        # hospital_coverage: delivery ratio for hospital loads only
+        hosp_indices = [i for i in range(n) if self.loads[i][1] == RegionType.HOSPITAL]
+        if hosp_indices:
+            hospital_score = sum(
+                min(dist[i], demands[i]) / demands[i] for i in hosp_indices
+            ) / len(hosp_indices)
+        else:
+            hospital_score = delivery_ratio  # no hospitals → use overall as proxy
+
+        # battery_management: fraction of battery remaining after this step
+        # (rewards not draining the battery dry; penalises reckless SPEND)
+        battery_score = self.battery / MAX_BATTERY
+
+        task_scores = {
+            "delivery":           round(delivery_score, 4),
+            "hospital_coverage":  round(hospital_score, 4),
+            "battery_management": round(battery_score,  4),
+        }
+
         # --- 5. Advance time slot ---
         self.time_slot = (self.time_slot + 1) % 8
 
@@ -216,7 +239,7 @@ class EnergyGridEnvironment(Environment):
             demand_trend = 0
         self.prev_total_demand = sum(demands)
 
-        return self._make_obs(next_demands, reward=reward, done=done, message=message, generation_forecast=next_forecast, demand_trend=demand_trend)
+        return self._make_obs(next_demands, reward=reward, done=done, message=message, generation_forecast=next_forecast, demand_trend=demand_trend, task_scores=task_scores)
 
     @property
     def state(self) -> State:
@@ -243,39 +266,55 @@ class EnergyGridEnvironment(Environment):
         multiplier = random.uniform(lo, hi)
         return max(1, round(base * multiplier))
 
-    def _type_weights(self, action: EnergyGridAction) -> dict:
-        """Map each RegionType to its numeric weight from the action."""
-        weight_map = {AllocWeight.NORMAL: 1.0, AllocWeight.HIGH: 2.0}
-        return {
-            RegionType.RESIDENTIAL: weight_map[action.residential],
-            RegionType.INDUSTRIAL:  weight_map[action.industrial],
-            RegionType.COMMERCIAL:  weight_map[action.commercial],
-            RegionType.HOSPITAL:    weight_map[action.hospital],
-        }
-
     def _priority_order(self, action: EnergyGridAction, demands: list[int]) -> list[int]:
-        """Sort load indices by (weight × demand) descending — highest-priority loads get battery first."""
-        tw = self._type_weights(action)
-        return sorted(range(len(demands)), key=lambda i: -(tw[self.loads[i][1]] * demands[i]))
+        """Sort load indices for battery allocation based on strategy."""
+        if action.action == DistributeAction.MIN_FIRST:
+            return sorted(range(len(demands)), key=lambda i: demands[i])
+        elif action.action in (DistributeAction.MAX_FIRST, DistributeAction.PROPORTIONAL):
+            return sorted(range(len(demands)), key=lambda i: -demands[i])
+        else:  # EQUAL — any order is fine
+            return list(range(len(demands)))
 
     def _distribute(self, action: EnergyGridAction, total: int, demands: list[int]) -> list[int]:
-        """Allocate power proportionally to each load's (weight × demand).
-        The weights come from the action, learned by the agent — no hard-coded strategy.
-        """
-        n  = len(demands)
-        tw = self._type_weights(action)
-        weighted = [demands[i] * tw[self.loads[i][1]] for i in range(n)]
-        total_w  = sum(weighted)
-        if total_w == 0:
+        """Allocate power according to the chosen distribution strategy."""
+        n = len(demands)
+        if action.action == DistributeAction.EQUAL:
             base, extra = divmod(total, n)
             return [base + (1 if i < extra else 0) for i in range(n)]
-        alloc     = [int(total * w / total_w) for w in weighted]
-        remainder = total - sum(alloc)
-        for i in sorted(range(n), key=lambda i: -weighted[i])[:remainder]:
-            alloc[i] += 1
-        return alloc
+        elif action.action == DistributeAction.MIN_FIRST:
+            order  = sorted(range(n), key=lambda i: demands[i])
+            alloc  = [0] * n
+            budget = total
+            for i in order:
+                give     = min(demands[i], budget)
+                alloc[i] = give
+                budget  -= give
+                if budget <= 0:
+                    break
+            return alloc
+        elif action.action == DistributeAction.MAX_FIRST:
+            order  = sorted(range(n), key=lambda i: -demands[i])
+            alloc  = [0] * n
+            budget = total
+            for i in order:
+                give     = min(demands[i], budget)
+                alloc[i] = give
+                budget  -= give
+                if budget <= 0:
+                    break
+            return alloc
+        else:  # PROPORTIONAL
+            total_d = sum(demands)
+            if total_d == 0:
+                base, extra = divmod(total, n)
+                return [base + (1 if i < extra else 0) for i in range(n)]
+            alloc     = [int(total * demands[i] / total_d) for i in range(n)]
+            remainder = total - sum(alloc)
+            for i in sorted(range(n), key=lambda i: -demands[i])[:remainder]:
+                alloc[i] += 1
+            return alloc
 
-    def _make_obs(self, demands: list[int], reward: float, done: bool, message: str, generation_forecast: int = 0, demand_trend: int = 0) -> EnergyGridObservation:
+    def _make_obs(self, demands: list[int], reward: float, done: bool, message: str, generation_forecast: int = 0, demand_trend: int = 0, task_scores: dict | None = None) -> EnergyGridObservation:
         types = [load[1] for load in self.loads]
         return EnergyGridObservation(
             time_slot        = self.time_slot,
@@ -291,7 +330,8 @@ class EnergyGridEnvironment(Environment):
             generation_forecast = generation_forecast,
             battery             = self.battery,
             demand_trend        = demand_trend,
-            reward           = reward,
+            task_scores         = task_scores or {},
+            reward              = reward,
             done             = done,
             message          = message,
         )

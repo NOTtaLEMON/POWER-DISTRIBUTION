@@ -63,20 +63,18 @@ import numpy as np
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(__file__))
 from energy_grid_env.server.energy_grid_environment import EnergyGridEnvironment
-from itertools import product
-from energy_grid_env.models import AllocWeight, BatteryMode, EnergyGridAction
+from energy_grid_env.models import DistributeAction, BatteryMode, EnergyGridAction
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-# Action space: independent weight (NORMAL/HIGH) for each of 4 region types
-# plus battery mode — 2^4 × 3 = 48 actions.
-# No hand-coded strategies; the agent learns its own allocation policy.
-WEIGHT_OPTIONS  = list(AllocWeight)   # NORMAL, HIGH
-BATTERY_OPTIONS = list(BatteryMode)   # SAVE, MODERATE, SPEND
+# Action space: 4 distribution strategies × 3 battery modes = 12 actions.
+# The agent learns which strategy fits which supply/demand/hospital state.
+DIST_OPTIONS    = list(DistributeAction)  # EQUAL, MIN_FIRST, MAX_FIRST, PROPORTIONAL
+BATTERY_OPTIONS = list(BatteryMode)       # SAVE, MODERATE, SPEND
 ACTIONS = [
-    (r, i, c, h, b)
-    for r, i, c, h in product(WEIGHT_OPTIONS, repeat=4)
+    (d, b)
+    for d in DIST_OPTIONS
     for b in BATTERY_OPTIONS
 ]
 N_ACTIONS = len(ACTIONS)
@@ -208,7 +206,7 @@ def trend_arrow(values: list[float]) -> str:
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
-EPISODES      = 40000  # 48 actions × 108 states; more episodes for good Q-value coverage
+EPISODES      = 20000  # 12 actions × 108 states — smaller space needs fewer episodes
 MAX_STEPS     = 8     # one full day = 8 × 3-hour slots
 ALPHA_START   = 0.4   # high initial learning rate — converge fast early on
 ALPHA_END     = 0.05  # decay to low rate at end — stable fine-tuning
@@ -244,9 +242,9 @@ for episode in range(1, EPISODES + 1):
         else:
             action_idx = int(np.argmax(get_q(state)))
 
-        r, i, c, h, batt = ACTIONS[action_idx]
+        d, batt = ACTIONS[action_idx]
         action = EnergyGridAction(
-            residential=r, industrial=i, commercial=c, hospital=h,
+            action=d,
             battery_mode=batt,
         )
         obs        = env.step(action)
@@ -294,9 +292,9 @@ def run_agent(use_q: bool, episodes: int = 200) -> float:
                 action_idx = int(np.argmax(get_q(state)))
             else:
                 action_idx = random.randint(0, N_ACTIONS - 1)
-            r, i, c, h, batt = ACTIONS[action_idx]
+            d, batt = ACTIONS[action_idx]
             obs = env.step(EnergyGridAction(
-                residential=r, industrial=i, commercial=c, hospital=h,
+                action=d,
                 battery_mode=batt,
             ))
             ep_reward += obs.reward

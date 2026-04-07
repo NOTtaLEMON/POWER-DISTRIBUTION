@@ -9,7 +9,7 @@ Run:  python train.py   # first time, to generate qtable.json
 
 import json
 import os
-from energy_grid_env.models import AllocWeight, BatteryMode, RegionType
+from energy_grid_env.models import DistributeAction, BatteryMode, RegionType
 
 REGION_LABELS = {
     "R": RegionType.RESIDENTIAL,
@@ -17,8 +17,6 @@ REGION_LABELS = {
     "C": RegionType.COMMERCIAL,
     "H": RegionType.HOSPITAL,
 }
-
-WEIGHT_MAP = {AllocWeight.NORMAL: 1.0, AllocWeight.HIGH: 2.0}
 
 QTABLE_PATH = os.path.join(os.path.dirname(__file__), "qtable.json")
 
@@ -28,10 +26,10 @@ def load_qtable():
         return None, None
     with open(QTABLE_PATH) as f:
         data = json.load(f)
-    # Each action is [res, ind, com, hos, bat] as enum value strings
+    # Each action is [dist, bat] as enum value strings
     action_index = [
-        (AllocWeight(r), AllocWeight(i), AllocWeight(c), AllocWeight(h), BatteryMode(b))
-        for r, i, c, h, b in data["actions"]
+        (DistributeAction(d), BatteryMode(b))
+        for d, b in data["actions"]
     ]
     table = {}
     for state_str, entry in data["table"].items():
@@ -69,22 +67,52 @@ def encode_state(total_demand, generation_forecast, battery, num_hospital, deman
 # Distribution logic (mirrors energy_grid_environment.py — no server needed)
 # ---------------------------------------------------------------------------
 
-def distribute(type_weights: dict, total: int, demands: list[int], load_types: list) -> list[int]:
-    n        = len(demands)
-    weighted = [demands[i] * type_weights[load_types[i]] for i in range(n)]
-    total_w  = sum(weighted)
-    if total_w == 0:
+def distribute(strategy: DistributeAction, total: int, demands: list[int]) -> list[int]:
+    n = len(demands)
+    if strategy == DistributeAction.EQUAL:
         base, extra = divmod(total, n)
         return [base + (1 if i < extra else 0) for i in range(n)]
-    alloc     = [int(total * w / total_w) for w in weighted]
-    remainder = total - sum(alloc)
-    for i in sorted(range(n), key=lambda i: -weighted[i])[:remainder]:
-        alloc[i] += 1
-    return alloc
+    elif strategy == DistributeAction.MIN_FIRST:
+        order  = sorted(range(n), key=lambda i: demands[i])
+        alloc  = [0] * n
+        budget = total
+        for i in order:
+            give     = min(demands[i], budget)
+            alloc[i] = give
+            budget  -= give
+            if budget <= 0:
+                break
+        return alloc
+    elif strategy == DistributeAction.MAX_FIRST:
+        order  = sorted(range(n), key=lambda i: -demands[i])
+        alloc  = [0] * n
+        budget = total
+        for i in order:
+            give     = min(demands[i], budget)
+            alloc[i] = give
+            budget  -= give
+            if budget <= 0:
+                break
+        return alloc
+    else:  # PROPORTIONAL
+        total_d = sum(demands)
+        if total_d == 0:
+            base, extra = divmod(total, n)
+            return [base + (1 if i < extra else 0) for i in range(n)]
+        alloc     = [int(total * demands[i] / total_d) for i in range(n)]
+        remainder = total - sum(alloc)
+        for i in sorted(range(n), key=lambda i: -demands[i])[:remainder]:
+            alloc[i] += 1
+        return alloc
 
 
-def priority_order(type_weights: dict, demands: list[int], load_types: list) -> list[int]:
-    return sorted(range(len(demands)), key=lambda i: -(type_weights[load_types[i]] * demands[i]))
+def priority_order(strategy: DistributeAction, demands: list[int]) -> list[int]:
+    if strategy == DistributeAction.MIN_FIRST:
+        return sorted(range(len(demands)), key=lambda i: demands[i])
+    elif strategy in (DistributeAction.MAX_FIRST, DistributeAction.PROPORTIONAL):
+        return sorted(range(len(demands)), key=lambda i: -demands[i])
+    else:
+        return list(range(len(demands)))
 
 
 def apply_battery(
@@ -181,23 +209,17 @@ def main():
     if state in qtable:
         action_idx = int(max(range(len(qtable[state])), key=lambda i: qtable[state][i]))
     else:
-        # Unseen state — fall back to NORMAL weights + SPEND
+        # Unseen state — fall back to PROPORTIONAL + SPEND
         action_idx = next(
             i for i, a in enumerate(action_index)
-            if all(w == AllocWeight.NORMAL for w in a[:4]) and a[4] == BatteryMode.SPEND
+            if a[0] == DistributeAction.PROPORTIONAL and a[1] == BatteryMode.SPEND
         )
 
-    res_w, ind_w, com_w, hos_w, bmode = action_index[action_idx]
-    type_weights = {
-        RegionType.RESIDENTIAL: WEIGHT_MAP[res_w],
-        RegionType.INDUSTRIAL:  WEIGHT_MAP[ind_w],
-        RegionType.COMMERCIAL:  WEIGHT_MAP[com_w],
-        RegionType.HOSPITAL:    WEIGHT_MAP[hos_w],
-    }
+    strategy, bmode = action_index[action_idx]
 
     # --- Compute ---
-    dist  = distribute(type_weights, generation, demands, types)
-    order = priority_order(type_weights, demands, types)
+    dist  = distribute(strategy, generation, demands, types)
+    order = priority_order(strategy, demands)
     dist, battery_used = apply_battery(dist, demands, battery, bmode, order)
 
     gen_used    = sum(min(demands[i], dist[i]) for i in range(n))
@@ -210,7 +232,7 @@ def main():
 
     # --- Output ---
     print(f"\n{SEP}")
-    print(f"  Agent weights →  RES:{res_w.value}  IND:{ind_w.value}  COM:{com_w.value}  HOS:{hos_w.value}  | battery: {bmode.value}")
+    print(f"  Agent decision →  strategy: {strategy.value}  | battery: {bmode.value}")
     print(SEP)
     print(f"  {'#':<4} {'Type':<14} {'Demand':>7} {'Supplied':>9} {'Met':>8}  {'Status'}")
     print(f"  {'─'*4} {'─'*14} {'─'*7} {'─'*9} {'─'*8}  {'─'*12}")

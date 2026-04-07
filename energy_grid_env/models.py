@@ -63,6 +63,9 @@ class EnergyGridObservation(Observation):
     # +1 = rising   (demand rose >10%)      → peak may be approaching, plan ahead
     demand_trend: int = Field(0, description="Demand trend vs previous step: -1 falling, 0 flat, +1 rising")
 
+    # Per-step task grader scores (all 0.0–1.0)
+    task_scores:  dict  = Field(default_factory=dict, description="Grader scores: delivery, hospital_coverage, battery_management")
+
     reward:       float = Field(0.0,   description="Reward from the last action")
     done:         bool  = Field(False, description="Whether the episode has ended")
     message:      str   = Field("",    description="Human-readable status message")
